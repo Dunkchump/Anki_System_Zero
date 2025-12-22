@@ -1,0 +1,21 @@
+# --- Python (Системні файли та віртуальне оточення) ---
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# --- Generated Assets (Те, що генерується автоматично) ---
+# Ми не заливаємо медіа, бо вони займають багато місця і генеруються скриптом
+media/
+# Ми не заливаємо готовий файл колоди, бо це результат роботи
+*.apkg
+
+# --- JavaScript / Node (Сміття, якщо є) ---
+node_modules/
+package-lock.json
+package.json
+
+# --- OS System Files (Системні файли Windows/Mac) ---
+.DS_Store
+Thumbs.db
