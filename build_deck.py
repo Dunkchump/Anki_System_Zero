@@ -1,7 +1,7 @@
 """
 System Zero: Automated Anki Deck Generator
 ------------------------------------------
-Version: 57.0 (UI Final: Blue Memory Hook + Boxed Hints)
+Version: 61.0 (Fix: Split Analogues by <br> tags - Guaranteed Table Layout)
 """
 
 import asyncio
@@ -20,27 +20,29 @@ import pandas as pd
 import aiohttp
 
 # --- 🌍 LANGUAGE SWITCHER ---
-CURRENT_LANG = "EN"
+CURRENT_LANG = "DE"
 
 # --- CONFIGURATION MAP ---
 LANG_CONFIG = {
     "DE": {
-        "deck_name": "🇩🇪 German: System Zero",
+        "deck_name": "🇩🇪 German new style",
         "voice": "de-DE-ConradNeural",
         "voice_id": "CONRAD",
         "label": "DEUTSCH",
         "strip_regex": r'^(der|die|das)\s+',
         "forvo_lang": "de",
-        "model_id": 1607393100 # Final ID
+        # !!! NEW ID to force update !!!
+        "model_id": 1607393140 
     },
     "EN": {
-        "deck_name": "🇬🇧 English: System Zero",
+        "deck_name": "🇬🇧 English: System Zero max",
         "voice": "en-GB-SoniaNeural",
         "voice_id": "SONIA",
         "label": "ENGLISH",
         "strip_regex": r'^(to|the|a|an)\s+',
         "forvo_lang": "en",
-        "model_id": 1607393101 # Final ID
+        # !!! NEW ID to force update !!!
+        "model_id": 1607393141 
     }
 }
 
@@ -49,7 +51,8 @@ class Config:
     settings = LANG_CONFIG.get(CURRENT_LANG, LANG_CONFIG["DE"])
     
     MODEL_ID: int = settings["model_id"]
-    DECK_ID: int = 2059400300 if CURRENT_LANG == "EN" else 2059400310
+    # !!! NEW DECK ID to force update !!!
+    DECK_ID: int = 2059400400 if CURRENT_LANG == "EN" else 2059400410
     
     DECK_NAME: str = settings["deck_name"]
     VOICE: str = settings["voice"]
@@ -112,6 +115,32 @@ class CardTemplates:
         border-radius: 8px;
         font-size: 0.95em;
         border-left: 4px solid #1971c2;
+    }
+
+    /* ANALOGUES TABLE (BULLETPROOF) */
+    .analogues-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.95em;
+        margin-top: 5px;
+    }
+    .ana-row td {
+        padding-bottom: 6px; /* Spacing between rows */
+        vertical-align: top;
+    }
+    .ana-lang {
+        text-align: right;
+        font-weight: bold;
+        color: #adb5bd;
+        padding-right: 12px;
+        border-right: 2px solid #e9ecef; /* The line */
+        width: 35px; /* Fixed width prevents jumping */
+        white-space: nowrap;
+    }
+    .ana-word {
+        text-align: left;
+        padding-left: 12px;
+        color: #343a40;
     }
 
     .sentence-container {
@@ -240,6 +269,13 @@ class CardTemplates:
         </div>
 
         <div class="section"><span class="label">MEMORY HOOK</span><div class="mnemonic-box">💡 {{Mnemonic}}</div></div>
+
+        {{#Analogues}}
+        <div class="section">
+            <span class="label">ANALOGUES</span>
+            {{Analogues}}
+        </div>
+        {{/Analogues}}
         
         {{#Image}}<div class="section" style="padding:0;"><div class="img-box">{{Image}}</div></div>{{/Image}}
         
@@ -255,6 +291,7 @@ class CardTemplates:
     </div>
     """ + JS_PLAYER
     
+    # Blue Hint Box in Production Card
     FRONT_PROD = """<div class="card-container"><div style="padding:40px 20px; text-align:center;"><div style="font-size:0.8em; color:#bbb; text-transform:uppercase;">TRANSLATE</div><div style="font-size:1.8em; font-weight:bold; color:#2c3e50; margin-top:10px;">{{Meaning}}</div><div class="mnemonic-box" style="margin-top:20px;border-left: none">Hint: {{Mnemonic}}</div></div></div>"""
     FRONT_LIST = """<div class="card-container"><div style="padding:50px 20px; text-align:center;"><div style="font-size:4em;">🎧</div><div style="margin-top:20px; color:#888;">Listen & Recognize</div><div style="display:none;">{{AudioWord}}</div><button class="pill-btn" style="margin-top:20px; width:150px;" onclick="document.getElementById('q_audio').play()">▶ Play Again</button><audio id="q_audio" src="{{Audio_Path_Word}}" autoplay></audio></div></div>"""
     FRONT_CLOZE = r"""<div class="card-container"><div class="header-box bg-none"><div style="font-size:1.2em;">Complete the Context</div></div><div class="section" style="padding: 20px;"><div id="context-sentence" style="font-size:1.1em; line-height:1.6;">{{ContextSentences}}</div></div></div><script>var contextDiv=document.getElementById("context-sentence");if(contextDiv){var content=contextDiv.innerHTML;var re=/<b>(.*?)<\/b>/gi;contextDiv.innerHTML=content.replace(re,"<span style='color:#3498db; border-bottom:2px solid #3498db; font-weight:bold;'>[...]</span>");}</script>"""
@@ -358,7 +395,7 @@ class AnkiDeckBuilder:
 
         return genanki.Model(
             Config.MODEL_ID,
-            f'System Zero {CURRENT_LANG} v57.0',
+            f'System Zero {CURRENT_LANG} v61.0',
             fields=fields,
             templates=[
                 {'name': '1. Recognition', 'qfmt': front_rec_safe, 'afmt': back_rec_safe},
@@ -380,6 +417,30 @@ class AnkiDeckBuilder:
                 cleaned_lines.append(re.sub(r'^\s*\d+[\.\)]\s*', '', line))
         return "".join(cleaned_lines)
 
+    # --- FIXED: Use REGEX to split by <br> or newline ---
+    def format_analogues_html(self, text: str) -> str:
+        if not text or str(text).lower() == 'nan': return ""
+        
+        # THIS WAS THE FIX: Split by newline OR <br> tag
+        lines = re.split(r'\n|<br\s*/?>', str(text))
+        
+        html_out = '<table class="analogues-table">'
+        
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            
+            parts = line.split(':', 1)
+            if len(parts) == 2:
+                code = parts[0].strip()
+                word = parts[1].strip()
+                html_out += f'<tr class="ana-row"><td class="ana-lang">{code}</td><td class="ana-word">{word}</td></tr>'
+            else:
+                html_out += f'<tr class="ana-row"><td colspan="2" class="ana-word">{line}</td></tr>'
+        
+        html_out += '</table>'
+        return html_out
+
     async def process_row(self, index: int, row: pd.Series, total: int):
         await asyncio.sleep(random.uniform(0.05, 0.2))
         async with self.semaphore:
@@ -399,6 +460,10 @@ class AnkiDeckBuilder:
                 
                 raw_translation = str(row.get('ContextTranslation', ''))
                 clean_trans = self.clean_translation(raw_translation)
+
+                # --- PROCESS ANALOGUES (FIXED) ---
+                raw_analogues = str(row.get('Analogues', ''))
+                clean_analogues = self.format_analogues_html(raw_analogues)
 
                 cloze_context = raw_context
                 if not cloze_context and sentences[0]: cloze_context = sentences[0]
@@ -438,7 +503,8 @@ class AnkiDeckBuilder:
                         sentences[0], sentences[1], sentences[2],
                         clean_trans,
                         str(row.get('Etymology', '')), 
-                        str(row.get('Mnemonic','')), str(row.get('Analogues','')),
+                        str(row.get('Mnemonic','')), 
+                        clean_analogues, 
                         f'<img src="{f_img}">' if has_img else "", 
                         str(row.get('Tags', '')),
                         f"[sound:{f_word}]" if has_w else "",
