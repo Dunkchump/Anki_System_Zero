@@ -12,15 +12,20 @@ import time
 import random
 import ssl
 import html
+import json
+import shutil
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import edge_tts
 import genanki
 import pandas as pd
 import aiohttp
+from tqdm.asyncio import tqdm as atqdm
 
 # --- 🌍 LANGUAGE SWITCHER ---
-CURRENT_LANG = "DE"
+CURRENT_LANG = "EN"
 
 # --- CONFIGURATION MAP ---
 LANG_CONFIG = {
@@ -32,7 +37,7 @@ LANG_CONFIG = {
         "strip_regex": r'^(der|die|das)\s+',
         "forvo_lang": "de",
         # !!! NEW ID to force update !!!
-        "model_id": 1607393140 
+        "model_id": 1607393148 
     },
     "EN": {
         "deck_name": "🇬🇧 English: System Zero max",
@@ -42,7 +47,7 @@ LANG_CONFIG = {
         "strip_regex": r'^(to|the|a|an)\s+',
         "forvo_lang": "en",
         # !!! NEW ID to force update !!!
-        "model_id": 1607393141 
+        "model_id": 1607393149 
     }
 }
 
@@ -64,10 +69,13 @@ class Config:
     CONFETTI_URL: str = "https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"
     
     CONCURRENCY: int = 4
-    RETRIES: int = 3
-    TIMEOUT: int = 30
+    RETRIES: int = 5
+    TIMEOUT: int = 60  # Увеличено для генерации изображений
+    IMAGE_TIMEOUT: int = 90  # Отдельный таймаут для изображений
     MEDIA_DIR: str = "media"
     CSV_FILE: str = "vocabulary.csv"
+    REQUEST_DELAY_MIN: float = 0.5  # Минимальная задержка между запросами
+    REQUEST_DELAY_MAX: float = 3.5  # Максимальная задержка между запросами
 
 # --- TEMPLATES ---
 class CardTemplates:
@@ -79,7 +87,8 @@ class CardTemplates:
     .bg-der { background: linear-gradient(135deg, #2980b9, #3498db); } 
     .bg-die { background: linear-gradient(135deg, #c0392b, #e74c3c); } 
     .bg-das { background: linear-gradient(135deg, #27ae60, #2ecc71); } 
-    .bg-none, .bg-en, .bg-noun { background: linear-gradient(135deg, #2c3e50, #4ca1af); }
+    .bg-none { background: linear-gradient(135deg, #8e44ad, #9b59b6); } /* Фиолетовый для немецких слов без артиклей */
+    .bg-en, .bg-noun { background: linear-gradient(135deg, #2c3e50, #4ca1af); }
     
     .word-main { font-size: 2.5em; font-weight: 800; margin: 0; letter-spacing: -0.5px; line-height: 1.1; text-shadow: 0 2px 4px rgba(0,0,0,0.2); }
     .word-meta { font-size: 0.9em; opacity: 0.9; margin-top: 8px; font-family: monospace; }
@@ -311,26 +320,69 @@ class AssetManager:
         return str(raw_input).strip().strip('"').strip("'")
 
     @staticmethod
-    async def download_file(raw_input: str, filename: str) -> bool:
+    async def download_file(raw_input: str, filename: str, builder=None) -> bool:
+        """Загрузка файла с улучшенной обработкой и jitter для имитации пользователя"""
         url = AssetManager.extract_url_from_tag(raw_input)
         if not url or len(url) < 5: return False
         path = AssetManager.get_path(filename)
         if os.path.exists(path) and os.path.getsize(path) > 1000: return True
         
-        headers = {"User-Agent": "Mozilla/5.0"}
+        # Реалистичные headers для имитации браузера
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+            "Referer": "https://pollinations.ai/",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache"
+        }
+        
         ssl_ctx = ssl.create_default_context(); ssl_ctx.check_hostname = False; ssl_ctx.verify_mode = ssl.CERT_NONE
 
+        # Экспоненциальный backoff с jitter
         for attempt in range(Config.RETRIES):
             try:
+                # Случайная задержка перед запросом (jitter для имитации пользователя)
+                delay = random.uniform(Config.REQUEST_DELAY_MIN, Config.REQUEST_DELAY_MAX)
+                await asyncio.sleep(delay)
+                
                 connector = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-                    async with session.get(url, timeout=Config.TIMEOUT) as response:
+                # Увеличенный таймаут для изображений
+                timeout = aiohttp.ClientTimeout(total=Config.IMAGE_TIMEOUT)
+                async with aiohttp.ClientSession(connector=connector, headers=headers, timeout=timeout) as session:
+                    async with session.get(url) as response:
                         if response.status == 200:
                             content = await response.read()
-                            with open(path, 'wb') as f: f.write(content)
-                            return True
-                        else: await asyncio.sleep(1)
-            except Exception: await asyncio.sleep(1)
+                            if len(content) > 500:  # Проверка, что файл не пустой
+                                with open(path, 'wb') as f: f.write(content)
+                                if builder:
+                                    builder._adjust_concurrency(status_code=200, is_success=True)
+                                return True
+                        else:
+                            # Обработать статус 429 адаптивно
+                            if response.status == 429 and builder:
+                                builder._adjust_concurrency(status_code=429)
+                            
+                            # Экспоненциальный backoff: 2, 4, 8, 16, 32 секунд
+                            backoff = 2 ** attempt
+                            print(f"   ⚠️ Статус {response.status}, попытка {attempt+1}/{Config.RETRIES}, ожидание {backoff}с...")
+                            await asyncio.sleep(backoff)
+            except asyncio.TimeoutError:
+                print(f"   ⏱️ Timeout при загрузке, попытка {attempt+1}/{Config.RETRIES}")
+                if builder:
+                    builder._adjust_concurrency(is_success=False)
+                if attempt < Config.RETRIES - 1:
+                    await asyncio.sleep(2 ** attempt)  # Backoff
+            except Exception as e:
+                error_msg = str(e)[:50] if str(e) else "Unknown error"
+                print(f"   ❌ Ошибка загрузки: {error_msg}, попытка {attempt+1}/{Config.RETRIES}")
+                if builder:
+                    builder._adjust_concurrency(is_success=False)
+                if attempt < Config.RETRIES - 1:
+                    await asyncio.sleep(2 ** attempt)
+        
+        print(f"   ✗ Не удалось загрузить: {filename}")
         return False
 
     @staticmethod
@@ -348,30 +400,122 @@ class AssetManager:
         clean_text = AssetManager.clean_audio_text(text)
         path = AssetManager.get_path(filename)
         try:
-            print(f"   🗣️ TTS: '{text[:20]}...' -> '{clean_text[:20]}...'")
+            # Небольшая задержка перед TTS для избежания перегрузки
+            await asyncio.sleep(random.uniform(0.1, 0.3))
             communicate = edge_tts.Communicate(clean_text, Config.VOICE, volume=volume)
             await communicate.save(path)
             return True
         except Exception as e: 
-            print(f"TTS Error: {e}")
             return False
 
 # --- DECK BUILDER ---
 class AnkiDeckBuilder:
+    CACHE_FILE = "build_cache.json"
+    
     def __init__(self):
         self._ensure_media_dir()
         self.model = self._create_model()
         self.deck = genanki.Deck(Config.DECK_ID, Config.DECK_NAME)
         self.media_files = []
         self.semaphore = asyncio.Semaphore(Config.CONCURRENCY)
+        self.current_concurrency = Config.CONCURRENCY
+        self.cache = self._load_cache()
+        self.stats = {
+            'words_processed': 0,
+            'images_success': 0,
+            'images_failed': 0,
+            'audio_word_success': 0,
+            'audio_word_failed': 0,
+            'audio_sent_success': 0,
+            'audio_sent_failed': 0,
+            'total_bytes': 0,
+            'start_time': time.time()
+        }
+        # Адаптивна паралелізація
+        self.adaptive_stats = {
+            'consecutive_success': 0,
+            'consecutive_failures': 0,
+            'last_status_429': False,
+            'concurrency_adjustments': 0
+        }
 
     def _ensure_media_dir(self):
         if not os.path.exists(Config.MEDIA_DIR): os.makedirs(Config.MEDIA_DIR)
 
+    def _load_cache(self) -> dict:
+        """Завантажити кеш вже обробленних файлів"""
+        if os.path.exists(self.CACHE_FILE):
+            try:
+                with open(self.CACHE_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+
+    def _save_cache(self):
+        """Зберегти кеш"""
+        try:
+            with open(self.CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.cache, f, indent=2)
+        except:
+            pass
+
+    def _check_cache(self, filename: str) -> bool:
+        """Перевірити, чи файл вже в кеші"""
+        if filename not in self.cache:
+            return False
+        cache_time = self.cache[filename]
+        file_path = AssetManager.get_path(filename)
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 500:
+            return True
+        del self.cache[filename]
+        return False
+
+    def _update_cache(self, filename: str):
+        """Додати файл до кеша"""
+        self.cache[filename] = datetime.now().isoformat()
+        self._save_cache()
+
+    def _adjust_concurrency(self, status_code: int = None, is_success: bool = None):
+        """Адаптивна зміна паралелізації залежно від статусу сервера"""
+        if status_code == 429:  # Too Many Requests
+            self.adaptive_stats['last_status_429'] = True
+            self.adaptive_stats['consecutive_success'] = 0
+            self.adaptive_stats['consecutive_failures'] += 1
+            
+            # Зменшити паралелізацію на 50%
+            if self.current_concurrency > 1:
+                old_concurrency = self.current_concurrency
+                self.current_concurrency = max(1, int(self.current_concurrency * 0.5))
+                if old_concurrency != self.current_concurrency:
+                    self.semaphore = asyncio.Semaphore(self.current_concurrency)
+                    self.adaptive_stats['concurrency_adjustments'] += 1
+                    print(f"⚠️ 429 Too Many Requests! Паралелізація зменшена: {old_concurrency} → {self.current_concurrency}")
+        
+        elif status_code and status_code < 400:  # Успішний запит
+            self.adaptive_stats['consecutive_failures'] = 0
+            self.adaptive_stats['consecutive_success'] += 1
+            
+            # Якщо 5+ успіхів поспіль - спробувати подвоїти паралелізацію
+            if (self.adaptive_stats['consecutive_success'] >= 5 and 
+                self.current_concurrency < Config.CONCURRENCY * 2 and
+                not self.adaptive_stats['last_status_429']):
+                old_concurrency = self.current_concurrency
+                self.current_concurrency = min(Config.CONCURRENCY * 2, self.current_concurrency * 2)
+                if old_concurrency != self.current_concurrency:
+                    self.semaphore = asyncio.Semaphore(self.current_concurrency)
+                    self.adaptive_stats['concurrency_adjustments'] += 1
+                    self.adaptive_stats['consecutive_success'] = 0
+                    print(f"✅ Сервер швидкий! Паралелізація збільшена: {old_concurrency} → {self.current_concurrency}")
+        
+        elif is_success is False:  # Помилка завантаження
+            self.adaptive_stats['consecutive_success'] = 0
+            self.adaptive_stats['consecutive_failures'] += 1
+
     async def _download_confetti_lib(self):
         filename = "_confetti.js"
         if not os.path.exists(AssetManager.get_path(filename)):
-            try: await AssetManager.download_file(Config.CONFETTI_URL, filename)
+            try: await AssetManager.download_file(Config.CONFETTI_URL, filename, self)
             except: pass
         if os.path.exists(AssetManager.get_path(filename)):
              self.media_files.append(AssetManager.get_path(filename))
@@ -441,17 +585,20 @@ class AnkiDeckBuilder:
         html_out += '</table>'
         return html_out
 
-    async def process_row(self, index: int, row: pd.Series, total: int):
+    async def process_row(self, index: int, row: pd.Series, total: int, pbar):
         await asyncio.sleep(random.uniform(0.05, 0.2))
         async with self.semaphore:
             try:
                 raw_word = str(row.get('TargetWord', '')).strip()
-                if not raw_word: return
+                if not raw_word: 
+                    pbar.update(1)
+                    return
 
                 clean_word = re.sub(Config.STRIP_REGEX, '', raw_word, flags=re.IGNORECASE).strip()
                 base_hash = hashlib.md5((clean_word + str(row.get('Part_of_Speech', ''))).encode()).hexdigest()
                 uuid = f"{base_hash}_{CURRENT_LANG}"
                 
+                self.stats['words_processed'] += 1
                 print(f"[{index+1}/{total}] 🔄 Processing: {clean_word}...")
 
                 raw_context = str(row.get('ContextSentences', ''))
@@ -476,14 +623,61 @@ class AnkiDeckBuilder:
                 f_s3 = f"_sent_3_{uuid}_{vid}_v54.mp3"
 
                 tasks = []
-                tasks.append(AssetManager.download_file(str(row.get('Image', '')), f_img))
-                tasks.append(AssetManager.generate_audio(raw_word, f_word, volume="+40%"))
+                
+                # Перевірити кеш для файлів
+                if self._check_cache(f_img):
+                    tasks.append(asyncio.sleep(0))  # Пропустити, вже є
+                    has_img_cached = True
+                else:
+                    tasks.append(AssetManager.download_file(str(row.get('Image', '')), f_img, self))
+                    has_img_cached = False
+                
+                if self._check_cache(f_word):
+                    tasks.append(asyncio.sleep(0))
+                    has_w_cached = True
+                else:
+                    tasks.append(AssetManager.generate_audio(raw_word, f_word, volume="+40%"))
+                    has_w_cached = False
+                
                 tasks.append(AssetManager.generate_audio(sentences[0], f_s1, volume="+0%") if sentences[0] else asyncio.sleep(0))
                 tasks.append(AssetManager.generate_audio(sentences[1], f_s2, volume="+0%") if sentences[1] else asyncio.sleep(0))
                 tasks.append(AssetManager.generate_audio(sentences[2], f_s3, volume="+0%") if sentences[2] else asyncio.sleep(0))
 
                 results = await asyncio.gather(*tasks)
                 has_img, has_w, has_s1, has_s2, has_s3 = results
+                
+                # Оновити кеш і статистику
+                if has_img or has_img_cached:
+                    self.stats['images_success'] += 1
+                    if has_img:
+                        self._update_cache(f_img)
+                else:
+                    self.stats['images_failed'] += 1
+                
+                if has_w or has_w_cached:
+                    self.stats['audio_word_success'] += 1
+                    if has_w:
+                        self._update_cache(f_word)
+                else:
+                    self.stats['audio_word_failed'] += 1
+                
+                if has_s1:
+                    self.stats['audio_sent_success'] += 1
+                    self._update_cache(f_s1)
+                elif sentences[0]:
+                    self.stats['audio_sent_failed'] += 1
+                
+                if has_s2:
+                    self.stats['audio_sent_success'] += 1
+                    self._update_cache(f_s2)
+                elif sentences[1]:
+                    self.stats['audio_sent_failed'] += 1
+                
+                if has_s3:
+                    self.stats['audio_sent_success'] += 1
+                    self._update_cache(f_s3)
+                elif sentences[2]:
+                    self.stats['audio_sent_failed'] += 1
 
                 if has_img: self.media_files.append(AssetManager.get_path(f_img))
                 if has_w: self.media_files.append(AssetManager.get_path(f_word))
@@ -493,6 +687,8 @@ class AnkiDeckBuilder:
 
                 gender = "en" if CURRENT_LANG == "EN" else str(row.get('Gender', '')).strip().lower()
                 if not gender or gender == "nan": gender = "none"
+                
+                pbar.update(1)
 
                 note = genanki.Note(
                     model=self.model,
@@ -518,18 +714,83 @@ class AnkiDeckBuilder:
                     tags=str(row.get('Tags', '')).split(), guid=uuid
                 )
                 self.deck.add_note(note)
-                print(f"   ✅ Ready: {clean_word}")
 
             except Exception as e:
                 print(f"⚠️ Error processing row {index}: {e}")
 
     def export_package(self):
+        """Експортувати колоду з резервною копією та статистикою"""
         filename = f"system_zero_{CURRENT_LANG.lower()}.apkg"
         valid_media = list(set([f for f in self.media_files if os.path.exists(f)]))
+        
+        # Обчислити розмір файлів
+        total_size = sum(os.path.getsize(f) for f in valid_media if os.path.exists(f))
+        self.stats['total_bytes'] = total_size
+        
+        # Резервна копія старого файлу
+        if os.path.exists(filename):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_filename = f"system_zero_{CURRENT_LANG.lower()}_{timestamp}.apkg"
+            shutil.copy2(filename, backup_filename)
+            print(f"💾 Резервна копія: {backup_filename}")
+        
+        # Створити пакет
         package = genanki.Package(self.deck)
         package.media_files = valid_media
         package.write_to_file(filename)
-        print(f"\n🏁 SUCCESS! Package created: {filename} ({len(self.deck.notes)} notes)")
+        
+        # Показати детальну статистику
+        self._print_statistics(filename, total_size)
+        
+        # Прибрати старі резервні копії (залишити останні 3)
+        self._cleanup_old_backups()
+
+    def _print_statistics(self, filename: str, total_size: int):
+        """Показати детальний звіт статистики"""
+        elapsed_time = time.time() - self.stats['start_time']
+        minutes, seconds = divmod(int(elapsed_time), 60)
+        
+        img_total = self.stats['images_success'] + self.stats['images_failed']
+        audio_w_total = self.stats['audio_word_success'] + self.stats['audio_word_failed']
+        audio_s_total = self.stats['audio_sent_success'] + self.stats['audio_sent_failed']
+        
+        img_pct = (self.stats['images_success'] / img_total * 100) if img_total > 0 else 0
+        audio_w_pct = (self.stats['audio_word_success'] / audio_w_total * 100) if audio_w_total > 0 else 0
+        audio_s_pct = (self.stats['audio_sent_success'] / audio_s_total * 100) if audio_s_total > 0 else 0
+        
+        size_mb = total_size / (1024 * 1024)
+        file_size = os.path.getsize(filename) / (1024 * 1024)
+        
+        print("\n" + "="*60)
+        print("✨ СТАТИСТИКА ЗБИРАННЯ КОЛОДИ")
+        print("="*60)
+        print(f"✅ Слова обрані:              {self.stats['words_processed']}")
+        print(f"📸 Зображення завантажені:   {self.stats['images_success']}/{img_total} ({img_pct:.1f}%)")
+        print(f"🎵 Аудіо слів завантажені:   {self.stats['audio_word_success']}/{audio_w_total} ({audio_w_pct:.1f}%)")
+        print(f"🎧 Аудіо речень завант.:     {self.stats['audio_sent_success']}/{audio_s_total} ({audio_s_pct:.1f}%)")
+        print(f"⏱️  Час виконання:            {minutes}м {seconds}с")
+        print(f"📦 Розмір медіа:              {size_mb:.1f} МБ")
+        print(f"💾 Розмір файлу:             {file_size:.1f} МБ")
+        print(f"📝 Файл створено:            {filename}")
+        
+        # Адаптивна паралелізація статистика
+        if self.adaptive_stats['concurrency_adjustments'] > 0:
+            print(f"\n⚙️ АДАПТИВНА ПАРАЛЕЛІЗАЦІЯ:")
+            print(f"🔄 Зміни паралелізації:      {self.adaptive_stats['concurrency_adjustments']}")
+            print(f"🔵 Поточна паралелізація:    {self.current_concurrency}/{Config.CONCURRENCY * 2}")
+        
+        print("="*60)
+
+    def _cleanup_old_backups(self, keep_count: int = 3):
+        """Видалити старі резервні копії, залишити тільки останні N"""
+        pattern = f"system_zero_{CURRENT_LANG.lower()}_*.apkg"
+        backups = sorted(Path('.').glob(pattern), key=os.path.getmtime, reverse=True)
+        
+        for old_backup in backups[keep_count:]:
+            try:
+                old_backup.unlink()
+            except:
+                pass
 
 async def main():
     if not os.path.exists(Config.CSV_FILE):
@@ -547,8 +808,14 @@ async def main():
 
     builder = AnkiDeckBuilder()
     await builder._download_confetti_lib()
-    tasks = [builder.process_row(i, row, len(df)) for i, row in df.iterrows()]
-    await asyncio.gather(*tasks)
+    
+    # Прогрес-бар з tqdm
+    print(f"📚 Processing {len(df)} words...\n")
+    
+    with atqdm(total=len(df), desc="Building deck", unit="word") as pbar:
+        tasks = [builder.process_row(i, row, len(df), pbar) for i, row in df.iterrows()]
+        await asyncio.gather(*tasks)
+    
     builder.export_package()
 
 if __name__ == "__main__":
